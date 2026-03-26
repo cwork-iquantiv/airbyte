@@ -4,234 +4,666 @@
 
 
 from abc import ABC
-from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+import collections
+import copy
+import datetime
+import time
+from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
+from urllib.parse import urljoin
+from dateutil.parser import parse
+import requests
+import xml.etree.ElementTree as ET
+import json
+import yaml
+
 
 import requests
 from airbyte_cdk.sources import AbstractSource
 from airbyte_cdk.sources.streams import Stream
-from airbyte_cdk.sources.streams.http import HttpStream
+from airbyte_cdk.models import SyncMode
+from airbyte_cdk.sources.streams.core import StreamData
+from airbyte_cdk.sources.streams.http import HttpStream,HttpClient
 from airbyte_cdk.sources.streams.http.requests_native_auth import TokenAuthenticator
+from airbyte_cdk.sources.streams.http.requests_native_auth.oauth import Oauth2Authenticator
+from airbyte_cdk.utils.traced_exception import AirbyteTracedException
 
 import logging
 logger = logging.getLogger("airbyte")
 
-"""
-TODO: Most comments in this class are instructive and should be deleted after the source is implemented.
 
-This file provides a stubbed example of how to use the Airbyte CDK to develop both a source connector which supports full refresh or and an
-incremental syncs from an HTTP API.
+class AcumaticaOauth2Authenticator(Oauth2Authenticator):
+    """
+    OAuth2 authenticator for Acumatica using Resource Owner Password Credentials (ROPC) flow.
+    Automatically handles token expiration and re-acquisition using username/password credentials.
+    """
 
-The various TODOs are both implementation hints and steps - fulfilling all the TODOs should be sufficient to implement one basic and one incremental
-stream from a source. This pattern is the same one used by Airbyte internally to implement connectors.
+    def __init__(self, config: Mapping[str, Any]):
+        self._username = config["USERNAME"]
+        self._password = config["PASSWORD"]
+        super().__init__(
+            token_refresh_endpoint=f'{config["BASEURL"]}/identity/connect/token',
+            client_id=config["CLIENTID"],
+            client_secret=config["CLIENTSECRET"],
+            refresh_token="",  # Not used in ROPC flow
+            grant_type="password",
+        )
 
-The approach here is not authoritative, and devs are free to use their own judgement.
+    def build_refresh_request_body(self) -> Mapping[str, Any]:
+        return {
+            "grant_type": self.get_grant_type(),
+            "client_id": self.get_client_id(),
+            "client_secret": self.get_client_secret(),
+            "username": self._username,
+            "password": self._password,
+            "scope": "api offline_access",
+        }
 
-There are additional required TODOs in the files within the integration_tests folder and the spec.yaml file.
-"""
-
+    def get_refresh_token(self) -> str:
+        return ""
 
 # Basic full refresh stream
-class AcumaticaStream(HttpStream, ABC):
+class AcumaticaStream(Stream, ABC):
 
-    def __init__(self,config: Mapping[str, Any],authenticator = None, api_budget = None):
-        super().__init__(authenticator=authenticator,api_budget=api_budget)
+    def __init__(self,name:str,endpointtype:str,
+                 config: Mapping[str, Any],
+                 schema: dict[str,Any],
+                 primary_key:Optional[Union[str, List[str], List[List[str]]]], 
+                 authenticator = None):
+        super().__init__()
         self.config=config
+        self._exit_on_rate_limit: bool = False
+        self._schema=schema
+        self._primary_key=primary_key
+        self._name=name
+        self._endpointtype=endpointtype
+        self._http_client = HttpClient(
+            name=self.name,
+            logger=self.logger,
+            authenticator=authenticator
+        )
+        overrides_list=self.config.get("STREAM_PAGESIZE_OVERRIDES",[])
+        stream_overrides={entry.split("::")[0]: int(entry.split("::")[1]) for entry in overrides_list if "::" in entry}
+        self._page_size=stream_overrides.get(self.name, self.config.get("PAGESIZE",1000))
+        self._streams_to_disable_paging=self.config.get("STREAMSTODISABLEPAGING",[])
+        self._max_empty_retries=self.config.get("MAX_EMPTY_RETRIES",10)
+        self._empty_retry_backoff_base=self.config.get("EMPTY_RETRY_BACKOFF_BASE",5)
+        self._current_page=0
 
-    # TODO: Fill in the url base. Required.
+    @property
+    def name(self):
+        return self._endpointtype + "__" + self._name
+    @property
+    def primary_key(self) -> Optional[Union[str, List[str], List[List[str]]]]:
+        return self._primary_key
     @property
     def url_base(self):
-        return self.config["BASEURL"] + "/entity/Default/23.200.001/"
-
-    def next_page_token(self, response: requests.Response) -> Optional[Mapping[str, Any]]:
-        """
-        TODO: Override this method to define a pagination strategy. If you will not be using pagination, no action is required - just return None.
-
-        This method should return a Mapping (e.g: dict) containing whatever information required to make paginated requests. This dict is passed
-        to most other methods in this class to help you form headers, request bodies, query params, etc..
-
-        For example, if the API accepts a 'page' parameter to determine which page of the result to return, and a response from the API contains a
-        'page' number, then this method should probably return a dict {'page': response.json()['page'] + 1} to increment the page count by 1.
-        The request_params method should then read the input next_page_token and set the 'page' param to next_page_token['page'].
-
-        :param response: the most recent response from the API
-        :return If there is another page in the result, a mapping (e.g: dict) containing information needed to query the next page in the response.
-                If there are no more pages in the result, return None.
-        """
-        return None
-
-    # def request_params(
-    #     self, stream_state: Mapping[str, Any], stream_slice: Mapping[str, any] = None, next_page_token: Mapping[str, Any] = None
-    # ) -> MutableMapping[str, Any]:
-    #     """
-    #     TODO: Override this method to define any query parameters to be set. Remove this method if you don't need to define request params.
-    #     Usually contains common params e.g. pagination size etc.
-    #     """
-    #     return {}
-
-    def request_params(
-        self, stream_state: Mapping[str, Any], stream_slice: Mapping[str, any] = None, next_page_token: Mapping[str, Any] = None
-    ) -> MutableMapping[str, Any]:
-        if(stream_state):
-            query=f"$filter={self.cursor_field} gte '{stream_state.get(self.cursor_field)}'"
-            #logger.info(f"Request Params - Query: {query}")
-        #logger.info(f"{inspect.stack()}")
-            return {"query":query}
-        return {}
-
-    def parse_response(self, response: requests.Response, **kwargs) -> Iterable[Mapping]:
-        """
-        TODO: Override this method to define how a response is parsed.
-        :return an iterable containing each record in the response
-        """   
-        # return [response.json()]
-        if len(response.content)> 0:
-            values=response.json()
-            return values
-        return []
-
-class Customers(AcumaticaStream):
-    """
-    TODO: Change class name to match the table/data source this stream corresponds to.
-    """
-
-    # TODO: Fill in the primary key. Required. This is usually a unique field in the stream, like an ID or a timestamp.
-    primary_key = "customer_id"
+        if(self._endpointtype=="contract"):
+            return self.config["BASEURL"] + "/entity/Default/" + self.config.get("APIVERSION","24.200.001") + "/"
+        elif(self._endpointtype=="DAC"):
+            return self.config["BASEURL"] + "/odatav4/" + self.config["TENANTNAME"] + "/"
+        elif(self._endpointtype=="Inquiry"):
+            return self.config["BASEURL"] + "/odata/" + self.config["TENANTNAME"] + "/"
+        else:
+            return self.config["BASEURL"]
 
     def path(
         self, stream_state: Mapping[str, Any] = None, stream_slice: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None
     ) -> str:
-        """
-        TODO: Override this method to define the path this stream corresponds to. E.g. if the url is https://example-api.com/v1/customers then this
-        should return "customers". Required.
-        """
-        return "customers"
+        return self._name
+
+    def get_json_schema(self):
+        return self._schema
+
+    def request_params(
+        self, stream_state: Mapping[str, Any], stream_slice: Mapping[str, any] = None, next_page_token: int = None
+    ) -> MutableMapping[str, Any]:
+        returnobj={}
+        if(stream_state):
+            if(self._endpointtype in ["DAC","Inquiry"]):
+                query=f"{self.cursor_field} gt {stream_state.get(self.cursor_field)}"
+            else:
+                query=f"{self.cursor_field} gt datetimeoffset'{stream_state.get(self.cursor_field)}'"
+            #logger.info(f"Request Params - Query: {query}")
+        #logger.info(f"{inspect.stack()}")
+            returnobj["$filter"] = query
+        if((next_page_token or next_page_token>=0) and self.name not in self._streams_to_disable_paging):
+            returnobj["$top"]=self._page_size
+            returnobj["$skip"]=next_page_token*self._page_size
+        return returnobj
+
+    def request_headers(
+        self, stream_state: Mapping[str, Any], stream_slice: Mapping[str, any] = None, next_page_token: Mapping[str, Any] = None
+        ) -> Mapping[str, Any]:
+        return {"Accept":"application/json",
+                "Content-Type":"application/json",
+                'Cache-Control': 'no-cache',
+                'Connection': 'Close'}
+    
+    def read_records(
+        self,
+        sync_mode: SyncMode,
+        cursor_field: Optional[List[str]] = None,
+        stream_slice: Optional[Mapping[str, Any]] = None,
+        stream_state: Optional[Mapping[str, Any]] = None,
+    )-> Iterable[StreamData]:
+        urlpath=urljoin(
+                self.url_base,
+                self.path(stream_state=stream_state, stream_slice=stream_slice),
+            )
+        
+        pagination_complete = False
+        self._current_page = 0
+        next_page_token=self._current_page
+        empty_retries = 0
+
+        while not pagination_complete:
+            try:
+
+                requestparams=self.request_params(stream_state=stream_state,stream_slice=stream_slice,next_page_token=next_page_token)
+                logger.info(f"Sending request to {urlpath} with params: {requestparams}")
+                _,response = self._http_client.send_request(http_method="GET"
+                                                                ,url=urlpath
+                                                                ,request_kwargs={}
+                                                                ,headers=self.request_headers(stream_state=stream_state,stream_slice=stream_slice)
+                                                                ,params=requestparams)
+                flattenedjsonvals=[]
+                if response.status_code != 200:
+                    raise Exception(f"Error pulling Data:{response.status_code} - {response.content}")
+                if len(response.content) > 0:
+                    responsejson=response.json()
+                    if("@odata.context" in responsejson or "odata.metadata" in responsejson):
+                        flattenedjsonvals=flatten_json_array(responsejson["value"])
+                    else:
+                        flattenedjsonvals=flatten_json_array(responsejson)
+
+                if len(response.content) == 0:
+                    # Empty body on 200 — transient API failure, retry with backoff
+                    empty_retries += 1
+                    if empty_retries > self._max_empty_retries:
+                        raise Exception(
+                            f"Stream {self.name}: received {self._max_empty_retries} consecutive empty 200 responses "
+                            f"at page {self._current_page} (params: {requestparams}). "
+                            f"The API is not returning data. Failing sync to prevent incomplete data."
+                        )
+                    wait_seconds = min(self._empty_retry_backoff_base ** empty_retries, 300)
+                    logger.warning(
+                        f"Stream {self.name}: empty 200 response at page {self._current_page}, "
+                        f"retry {empty_retries}/{self._max_empty_retries} after {wait_seconds}s"
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                empty_retries = 0
+                yield from flattenedjsonvals
+                if (len(flattenedjsonvals) == 0 or self.name in self._streams_to_disable_paging):
+                    pagination_complete = True
+                else:
+                    self._current_page += 1
+                    next_page_token=self._current_page
+            except AirbyteTracedException as ex:
+                # CDK raises this for failed requests (e.g. empty response from API)
+                # If we're in a date slice, treat as empty slice and move on
+                if stream_slice and "start_date" in stream_slice:
+                    logger.warning(
+                        f"Stream {self.name}: request failed for slice "
+                        f"{stream_slice['start_date']} to {stream_slice['end_date']}: {ex}. "
+                        f"Treating as empty slice."
+                    )
+                    pagination_complete = True
+                else:
+                    logger.error(ex)
+                    raise ex
+            except Exception as ex:
+                logger.error(ex)
+                raise ex
+            else:
+                logoutFromAcumatica(httpclient=self._http_client,config=self.config)
+
 
 # Basic incremental stream
 class IncrementalAcumaticaStream(AcumaticaStream, ABC):
-    """
-    TODO fill in details of this class to implement functionality related to incremental syncs for your connector.
-         if you do not need to implement incremental sync for any streams, remove this class.
-    """
+    def __init__(self,name:str,endpointtype:str,config: Mapping[str, Any],schema: dict[str,Any],primary_key:Optional[Union[str, List[str], List[List[str]]]],cursor_field:str,authenticator = None):
+        super().__init__(name=name,endpointtype=endpointtype,config=config,schema=schema,primary_key=primary_key,authenticator=authenticator)
+        self._cursor_field=cursor_field
+        self._initial_load_start_date=config.get("INITIAL_LOAD_START_DATE")
+        self._slice_range_days=config.get("SLICE_RANGE_DAYS", 7)
 
-    # TODO: Fill in to checkpoint stream reads after N records. This prevents re-reading of data if the stream fails for any reason.
     state_checkpoint_interval = 10
 
     @property
-    # def cursor_field(self) -> str:
-    #     """
-    #     TODO
-    #     Override to return the cursor field used by this stream e.g: an API entity might always use created_at as the cursor field. This is
-    #     usually id or date based. This field's presence tells the framework this in an incremental stream. Required for incremental.
+    def cursor_field(self) -> str:
+        return self._cursor_field
 
-    #     :return str: The name of the cursor field.
-    #     """
-    #     return []
+    def stream_slices(self, sync_mode: SyncMode, cursor_field: List[str] = None, stream_state: Mapping[str, Any] = None) -> Iterable[Optional[Mapping[str, Any]]]:
+        # Determine start date: from state if available, otherwise from config
+        if stream_state and self.cursor_field in stream_state:
+            cursor_value = stream_state[self.cursor_field]
+            # cursor_value could be a datetime object or string
+            if isinstance(cursor_value, str):
+                start = parse(cursor_value).replace(tzinfo=None)
+            else:
+                start = cursor_value.replace(tzinfo=None) if hasattr(cursor_value, 'replace') else parse(str(cursor_value)).replace(tzinfo=None)
+        elif self._initial_load_start_date:
+            start = parse(self._initial_load_start_date).replace(tzinfo=None)
+        else:
+            # No state and no start date configured — single unsliced request (original behavior)
+            yield None
+            return
+
+        # Always slice incremental syncs into date ranges
+        end = datetime.datetime.utcnow()
+        slice_delta = datetime.timedelta(days=self._slice_range_days)
+
+        slice_start = start
+        while slice_start < end:
+            slice_end = min(slice_start + slice_delta, end)
+            logger.info(f"Stream {self.name}: generating slice {slice_start.isoformat()}Z to {slice_end.isoformat()}Z")
+            yield {"start_date": slice_start.isoformat() + "Z", "end_date": slice_end.isoformat() + "Z"}
+            slice_start = slice_end
+
+    def request_params(
+        self, stream_state: Mapping[str, Any], stream_slice: Mapping[str, any] = None, next_page_token: int = None
+    ) -> MutableMapping[str, Any]:
+        returnobj={}
+        filters=[]
+
+        # Slice-based filter (always used when slices are active)
+        if stream_slice and "start_date" in stream_slice:
+            if self._endpointtype in ["DAC","Inquiry"]:
+                filters.append(f"{self.cursor_field} ge {stream_slice['start_date']}")
+                filters.append(f"{self.cursor_field} lt {stream_slice['end_date']}")
+            else:
+                filters.append(f"{self.cursor_field} ge datetimeoffset'{stream_slice['start_date']}'")
+                filters.append(f"{self.cursor_field} lt datetimeoffset'{stream_slice['end_date']}'")
+
+        if filters:
+            returnobj["$filter"] = " and ".join(filters)
+
+        if (next_page_token or next_page_token>=0) and self.name not in self._streams_to_disable_paging:
+            returnobj["$top"]=self._page_size
+            returnobj["$skip"]=next_page_token*self._page_size
+        return returnobj
 
     def get_updated_state(self, current_stream_state: MutableMapping[str, Any], latest_record: Mapping[str, Any]) -> Mapping[str, Any]:
-        """
-        Override to determine the latest state after reading the latest record. This typically compared the cursor_field from the latest record and
-        the current state and picks the 'most' recent cursor. This is how a stream's state is determined. Required for incremental.
-        """
-        return {}
-    # TODO: Implement Get Updated State
-    # TODO: Flatten returned data
-    # TODO: Implement dynamic discovery
-    # TODO: Test run incremental pull
-    # TODO: Logging
+        #If the pull dies midway and the records are not in order by last modified than this may make it so we lose records on restart.
+        current_cursor_value=parse(current_stream_state[self.cursor_field]) if self.cursor_field in current_stream_state else parse(latest_record[self.cursor_field])
+        latest_cursor_value=parse(latest_record[self.cursor_field])
+        #TODO: Handle other cursor values than dates
+        if(latest_cursor_value>current_cursor_value):
+            new_stream_state=dict(current_stream_state)
+            new_stream_state[self.cursor_field]=latest_cursor_value
+            return new_stream_state
+        elif(current_stream_state=={}):
+            return {self.cursor_field:latest_cursor_value}
+        else:
+            return current_stream_state
     
-class Salesorders(IncrementalAcumaticaStream):
-    """
-    TODO: Change class name to match the table/data source this stream corresponds to.
-    """
-    cursor_field="LastModified"
-
-    # TODO: Fill in the primary key. Required. This is usually a unique field in the stream, like an ID or a timestamp.
-    primary_key = "id"
-
-    def path(
-        self, stream_state: Mapping[str, Any] = None, stream_slice: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None
-    ) -> str:
-        """
-        TODO: Override this method to define the path this stream corresponds to. E.g. if the url is https://example-api.com/v1/customers then this
-        should return "customers". Required.
-        """
-        return "SalesOrder"
-
-
-class Employees(IncrementalAcumaticaStream):
-    """
-    TODO: Change class name to match the table/data source this stream corresponds to.
-    """
-
-    # TODO: Fill in the cursor_field. Required.
-    cursor_field = "start_date"
-
-    # TODO: Fill in the primary key. Required. This is usually a unique field in the stream, like an ID or a timestamp.
-    primary_key = "employee_id"
-
-    def path(self, **kwargs) -> str:
-        """
-        TODO: Override this method to define the path this stream corresponds to. E.g. if the url is https://example-api.com/v1/employees then this should
-        return "single". Required.
-        """
-        return "employees"
-
-    def stream_slices(self, stream_state: Mapping[str, Any] = None, **kwargs) -> Iterable[Optional[Mapping[str, any]]]:
-        """
-        TODO: Optionally override this method to define this stream's slices. If slicing is not needed, delete this method.
-
-        Slices control when state is saved. Specifically, state is saved after a slice has been fully read.
-        This is useful if the API offers reads by groups or filters, and can be paired with the state object to make reads efficient. See the "concepts"
-        section of the docs for more information.
-
-        The function is called before reading any records in a stream. It returns an Iterable of dicts, each containing the
-        necessary data to craft a request for a slice. The stream state is usually referenced to determine what slices need to be created.
-        This means that data in a slice is usually closely related to a stream's cursor_field and stream_state.
-
-        An HTTP request is made for each returned slice. The same slice can be accessed in the path, request_params and request_header functions to help
-        craft that specific request.
-
-        For example, if https://example-api.com/v1/employees offers a date query params that returns data for that particular day, one way to implement
-        this would be to consult the stream state object for the last synced date, then return a slice containing each date from the last synced date
-        till now. The request_params function would then grab the date from the stream_slice and make it part of the request by injecting it into
-        the date query param.
-        """
-        raise NotImplementedError("Implement stream slices or delete this method!")
-
-
 # Source
 class SourceAcumatica(AbstractSource):
     def check_connection(self, logger, config) -> Tuple[bool, any]:
-        """
-        TODO: Implement a connection check to validate that the user-provided config can be used to connect to the underlying API
+        auth = AcumaticaOauth2Authenticator(config)
+        try:
+            token = auth.get_access_token()
+            if token is not None:
+                return True, None
+            return False, "Failed to obtain access token"
+        except Exception as e:
+            return False, str(e)
 
-        See https://github.com/airbytehq/airbyte/blob/master/airbyte-integrations/connectors/source-stripe/source_stripe/source.py#L232
-        for an example.
+    def streams(self, config: Mapping[str, Any]) -> List[HttpStream]:
+        auth = AcumaticaOauth2Authenticator(config)
+        self.http_client = HttpClient(
+            name="StreamClient",
+            logger=logger,
+            authenticator=auth
+        )
+        #Get the contract based schemas
+        
+        streams=[]
+        # Contract Based Streams
+        contractschemas = getmetatdata(httpclient=self.http_client,config=config)
+        streams.extend(self.getStreams(config, "contract", auth, contractschemas))
+        #Odatav4 (Inquiry) Based Streams
+        odata3schemas=getodata3metadata(httpclient=self.http_client,endpointtype="Inquiry",config=config)
+        streams.extend(self.getStreams(config,"Inquiry", auth, odata3schemas))
+        #Odatav4 (DAC) Based Streams
+        odata4schemas=getodata4metadata(httpclient=self.http_client,endpointtype="DAC",config=config)
+        streams.extend(self.getStreams(config,"DAC", auth, odata4schemas))
 
-        :param config:  the user-input config object conforming to the connector's spec.yaml
-        :param logger:  logger object
-        :return Tuple[bool, any]: (True, None) if the input config can be used to connect to the API successfully, (False, error) otherwise.
-        """
-        # Acumatica OAuth2 credentials
-        token = get_access_token(config)
-        if token != None:
-            return True, None  
-        return False, None
+        return streams
 
-    def streams(self, config: Mapping[str, Any]) -> List[Stream]:
-        """
-        TODO: Replace the streams below with your own streams.
+    def getStreams(self, config, endpointtype, auth, schemas):
+        returnStreams=[]
+        for fullschemaname in schemas.keys():            
+            schemaobject=schemas[fullschemaname]
+            schemaname=schemaobject["schemaname"]
+            schema=schemaobject["schema"]
+            cursorfield=get_first_existing_property_name(schema["properties"],["LastModified","LastModifiedDateTime"])
+            primaryKey=schemaobject.get("primarykey","id")
+            if cursorfield:
+                stream=IncrementalAcumaticaStream(name=schemaname,endpointtype=endpointtype,authenticator=auth,config=config,schema=schema,primary_key=primaryKey,cursor_field=cursorfield)
+                returnStreams.append(stream)
+            else:
+                stream=AcumaticaStream(name=schemaname,endpointtype=endpointtype,authenticator=auth,config=config,schema=schema,primary_key=primaryKey)
+                returnStreams.append(stream)
+        return returnStreams
 
-        :param config: A Mapping of the user input configuration as defined in the connector spec.
-        """
-        # TODO remove the authenticator if not required.
-        auth = TokenAuthenticator(token=get_access_token(config))  # Oauth2Authenticator is also available if you need oauth support
-        return [Customers(authenticator=auth, config=config), Employees(authenticator=auth, config=config), Salesorders(authenticator=auth, config=config)]
-import requests
+def process_schema(schema,depth):
+    if isinstance(schema, dict):
+        if "allOf" in schema and depth==0:
+            # Process and merge schemas in 'allOf'
+            merged_schema = {}
+            for subschema in schema["allOf"]:
+                processed_subschema = process_schema(subschema,depth+1)
+                if processed_subschema:
+                    if processed_subschema.get("type") == "object" and "properties" in processed_subschema:
+                        if "type" not in merged_schema:
+                            merged_schema["type"] = "object"
+                            merged_schema["properties"] = {}
+                        merged_schema["properties"].update(processed_subschema["properties"])
+            return merged_schema if merged_schema else None
+        elif "allOf" in schema and depth>0:
+            return None
+        elif schema.get("type") == "object" and depth==1:
+            new_properties = {}
+            for prop_name, prop_schema in schema.get("properties", {}).items():
+                processed_prop = process_schema(prop_schema,depth+1)
+                if processed_prop is not None:
+                    new_properties[prop_name] = processed_prop
+            # Return the object if it has properties
+            if new_properties:
+                return {'type': 'object', 'properties': new_properties}
+            else:
+                return None
+        elif schema.get("type") == "object" and depth>1:
+            properties=schema.get("properties",{})
+            if set(properties.keys()) <= {"value", "error"} and "value" in properties:
+                # Process object properties
+                return properties["value"]
+            else:
+                return None
+        elif schema.get("type") == "array":
+            # Exclude arrays
+            return None
+        else:
+            # Return other types as is
+            return schema
+    else:
+        return None
+
+def get_first_existing_property_name(obj, property_names):
+    for name in property_names:
+        if isinstance(obj, dict) and name in obj:
+            return name
+        elif hasattr(obj, name):
+            return name
+    return None
+
+def flatten_value_error(schema):
+    if isinstance(schema, dict):
+        if schema.get("type") == "object" and "properties" in schema:
+            properties = schema["properties"]
+            # Check if properties only contain 'value' and/or 'error'
+            if set(properties.keys()) <= {"value", "error"} and "value" in properties:
+                # Replace the object with its 'value' property
+                return flatten_value_error(properties["value"])
+            else:
+                # Recursively process each property
+                new_properties = {}
+                for prop_name, prop_schema in properties.items():
+                    # Exclude arrays
+                    if prop_schema.get("type") == "array":
+                        continue
+                    processed_prop = flatten_value_error(prop_schema)
+                    if processed_prop is not None:
+                        new_properties[prop_name] = processed_prop
+                if new_properties:
+                    schema_copy = schema.copy()
+                    schema_copy["properties"] = new_properties
+                    return schema_copy
+                else:
+                    return None
+        else:
+            # For other types, return the schema as is
+            return schema
+    else:
+        return schema
+
+def resolve_refs(schema, definitions):
+    """
+    Recursively replace $ref in the schema with the actual definition from the definitions section.
+    """
+    if isinstance(schema, dict):
+        # Check if there's a $ref key in the current schema
+        if '$ref' in schema:
+            ref_name = schema['$ref'].split('/')[-1]
+            if ref_name in definitions:
+                # Replace the $ref with a deep copy of the referenced definition to avoid modification of the original
+                return resolve_refs(copy.deepcopy(definitions[ref_name]), definitions)
+        else:
+            # Recursively resolve $ref in properties and items
+            for key, value in schema.items():
+                schema[key] = resolve_refs(value, definitions)
+    elif isinstance(schema, list):
+        # Recursively resolve $ref in list items
+        schema = [resolve_refs(item, definitions) for item in schema]
+
+    return schema
+
+def getmetatdata(httpclient:HttpClient, config):
+#Get the entities from metadata and generate the schemas
+        headers= {#'User-Agent': 'python-requests/2.32.3'
+          'Accept': 'application/json'
+          , 'Connection': 'Close'
+          , 'Content-Type': 'application/json'
+          , 'Cache-Control': 'no-cache'}
+        metadataurl=urljoin(config["BASEURL"],"/entity/Default/" + config.get("APIVERSION","24.200.001") + "/swagger.json")
+        _,swaggerresponse = httpclient.send_request(http_method="GET",request_kwargs={},url=metadataurl,headers=headers)
+        swaggerjson=swaggerresponse.json()
+        logoutFromAcumatica(httpclient,config)
+        return extract_get_schemas(swaggerjson)
+
+def getodata4metadata(httpclient:HttpClient,endpointtype, config):
+#Get the entities from metadata and generate the schemas
+        headers= {#'User-Agent': 'python-requests/2.32.3'
+          'Accept': 'application/json'
+          , 'Connection': 'Close'
+          , 'Content-Type': 'application/json'
+          , 'Cache-Control': 'no-cache'}
+        tenantname=config["TENANTNAME"]
+        metadataurl=urljoin(config["BASEURL"],f"/ODatav4/{tenantname}/$metadata")
+        _,metadataresponse = httpclient.send_request(http_method="GET",request_kwargs={},url=metadataurl,headers=headers)
+        odata4xml=metadataresponse.text
+        logoutFromAcumatica(httpclient,config)
+        return odata_xml_to_json_schema(odata4xml,4,endpointtype)
+
+def getodata3metadata(httpclient:HttpClient,endpointtype,config):
+    headers= {#'User-Agent': 'python-requests/2.32.3'
+          'Accept': 'application/json'
+          , 'Connection': 'Close'
+          , 'Content-Type': 'application/json'
+          , 'Cache-Control': 'no-cache'}
+    tenantname=config["TENANTNAME"]
+    metadataurl=urljoin(config["BASEURL"],f"/OData/{tenantname}/$metadata")
+    _,metadataresponse = httpclient.send_request(http_method="GET",request_kwargs={},url=metadataurl,headers=headers)
+    odataxml=metadataresponse.text
+    logoutFromAcumatica(httpclient,config)
+    return odata_xml_to_json_schema(odataxml,3,endpointtype)
+    
 
 
+def odata_xml_to_json_schema(xml_string,version,endpointtype):
+    # Parse the XML string
+    root = ET.fromstring(xml_string)
 
-# Step 1: Obtain the OAuth2 token
+    # Define namespaces
+    namespaces = {}
+    
+    if version==4:
+        namespaces={
+            'edmx': 'http://docs.oasis-open.org/odata/ns/edmx',
+            'edm': 'http://docs.oasis-open.org/odata/ns/edm'
+        }
+    else:
+        namespaces={'edmx': 'http://schemas.microsoft.com/ado/2007/06/edmx',
+            'edm': 'http://schemas.microsoft.com/ado/2009/11/edm'}
+    
+    # Find edmx:DataServices node
+    data_services = root.find('edmx:DataServices',namespaces)
+    if data_services is None:
+        print("No edmx:DataServices node found")
+        return {}
+
+    # Build a mapping from EntityType names to their definitions
+    entity_types = {}
+    for schema in data_services.findall('edm:Schema',namespaces):
+        namespace_attr = schema.get('Namespace')
+        for entity_type in schema.findall('edm:EntityType',namespaces):
+            name = entity_type.get('Name')
+            full_name = f"{namespace_attr}.{name}"
+            entity_types[full_name] = entity_type
+
+    # Find the EntitySets
+    entity_sets = {}
+    for schema in data_services.findall('edm:Schema',namespaces):
+        for entity_container in schema.findall('edm:EntityContainer',namespaces):
+            for entity_set in entity_container.findall('edm:EntitySet',namespaces):
+                name = entity_set.get('Name')
+                entity_type = entity_set.get('EntityType')
+                entity_sets[name] = entity_type
+
+    # For each EntitySet, generate the JSON schema
+    schemas = {}
+    for entity_set_name, entity_type_full_name in entity_sets.items():
+        #TODO: Combine all the entity types in the tree of types that are in the schema
+        entity_type = entity_types.get(entity_type_full_name)
+        if not entity_type:
+            continue
+        streamdata={
+            'schema':{},
+            'primarykey':[],
+            'schemaname':entity_set_name
+        }
+        # Build the JSON schema
+        
+
+        schema,keys=fillSchemaFromEntityTypeTree(entity_types,entity_type,namespaces)
+        # Find the Key properties
+
+        
+        streamdata["primarykey"]=keys
+        streamdata["schema"]=schema
+        fullschemaname=f"{endpointtype}__" + entity_set_name
+        schemas[fullschemaname] = streamdata
+
+    return schemas
+def fillSchemaFromEntityTypeTree(entity_types,entity_type,namespaces) -> Tuple[dict[str,Any],list]:
+    schema = { 
+            'type': 'object',
+            'properties': dict(),
+            'required': [],
+        }
+    keys = []
+    if(entity_type.get("BaseType") is not None):
+        baseEntityType=entity_types.get(entity_type.get('BaseType'))
+        baseschema,basekeys=fillSchemaFromEntityTypeTree(entity_types,baseEntityType,namespaces)
+        if(baseschema is not None):
+            schema["properties"].update(baseschema["properties"])
+            schema["required"].extend(baseschema["required"])
+        if(basekeys is not None):
+            keys.extend(basekeys)
+    key_elements = entity_type.find('edm:Key',namespaces)
+    
+    if key_elements is not None:
+        for prop_ref in key_elements.findall('edm:PropertyRef',namespaces):
+            key_name = prop_ref.get('Name')
+            keys.append(key_name)
+
+    # Process Properties
+    for prop in entity_type.findall('edm:Property',namespaces):
+        prop_name = prop.get('Name')
+        prop_type = prop.get('Type')
+        json_type = map_edm_to_json_type(prop_type)
+        nullable = prop.get('Nullable', 'true').lower() == 'true'
+
+        schema['properties'][prop_name] = {
+            'type': json_type
+        }
+
+        # Add to required if it is a key or not nullable
+        if prop_name in keys or not nullable:
+            schema['required'].append(prop_name)
+
+    return schema,keys
+        
+def map_edm_to_json_type(edm_type):
+    # Simple mapping from EDM types to JSON Schema types
+    edm_to_json_type_map = {
+        'Edm.String': 'string',
+        'Edm.Int16': 'integer',
+        'Edm.Int32': 'integer',
+        'Edm.Int64': 'integer',
+        'Edm.Boolean': 'boolean',
+        'Edm.Decimal': 'number',
+        'Edm.Double': 'number',
+        'Edm.Single': 'number',
+        'Edm.DateTimeOffset': 'string',
+        'Edm.Guid': 'string',
+        'Edm.Binary': 'string',
+        'Edm.TimeOfDay': 'string',
+        'Edm.Date': 'string',
+        'Edm.Byte': 'integer',
+        'Edm.SByte': 'integer',
+        # Add more mappings as needed
+    }
+    # Handle collection types
+    if edm_type.startswith('Collection('):
+        item_type = edm_type[11:-1]
+        return {
+            'type': 'array',
+            'items': {
+                'type': edm_to_json_type_map.get(item_type, 'string')
+            }
+        }
+    return edm_to_json_type_map.get(edm_type, 'string')
+
+def logoutFromAcumatica(httpclient:HttpClient,config):
+        headers= {#'User-Agent': 'python-requests/2.32.3'
+          'Accept': 'application/json'
+          , 'Connection': 'Close'
+          , 'Content-Type': 'application/json'
+          , 'Cache-Control': 'no-cache'}
+        logouturl=urljoin(config["BASEURL"],'/entity/auth/logout')
+        _,logoutresponse=httpclient.send_request(http_method="POST",url=logouturl,request_kwargs={},headers=headers,data={})
+        if logoutresponse.ok:
+            logger.info("Logged Out")
+        else:
+            logger.info("Did not log out")
+
+def extract_get_schemas(swagger_json):
+    # Load the Swagger file (YAML or JSON)
+    swagger_spec = swagger_json
+
+    paths = swagger_spec.get('paths', {})
+    definitions = swagger_spec.get('definitions', {})
+    get_schemas = {}
+
+    for path, methods in paths.items():
+        if 'get' in methods and len(path.split("/"))==2:
+            get_method = methods['get']
+            responses = get_method.get('responses', {})
+            if '200' in responses:
+                schema = responses['200'].get('schema', {})
+                if schema:
+                    # Resolve any $ref within the schema
+                    resolved_schema = resolve_refs(schema, definitions)
+                    entity_name = path.strip('/').replace('/', '_')
+                    flattened_schema=process_schema(resolved_schema["items"],0)
+                    fullentityname="contract__"+entity_name
+                    get_schemas[fullentityname] = {'schema':flattened_schema,'schemaname':entity_name}
+
+    return get_schemas
+    
 def get_access_token(config):
     client_id = config["CLIENTID"]
     client_secret = config["CLIENTSECRET"]
@@ -257,29 +689,22 @@ def get_access_token(config):
     else:
         raise Exception(f"Failed to obtain access token: {response.status_code}, {response.text}")
 
-# Step 2: Use the token to make API requests
-def make_api_request(token, endpoint):
-    api_url = f'https://YOUR_ACUMATICA_INSTANCE/entity/{endpoint}'
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Accept': 'application/json'
-    }
-    
-    response = requests.get(api_url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(f"API request failed: {response.status_code}, {response.text}")
+def flatten_json(nested_json, parent_key='', separator='_'):
+        items = []
+        for key, value in nested_json.items():
+            new_key = f"{parent_key}{separator}{key}" if parent_key else key
+            
+            if isinstance(value, collections.abc.MutableMapping):
+                if 'value' in value:
+                    items.append((new_key, value['value']))
+                else:
+                    items.extend(flatten_json(value, new_key, separator=separator).items())
+            else:
+                items.append((new_key, value))
+        
+        return dict(items)
 
-if __name__ == '__main__':
-    try:
-        # Get access token
-        access_token = get_access_token()
-        
-        # Make API request using the obtained token
-        endpoint = 'Default/23.200.001/SalesOrder'
-        data = make_api_request(access_token, endpoint)
-        print("API response:", data)
-        
-    except Exception as e:
-        print("Error:", str(e))
+def flatten_json_array(json_array):
+    return [flatten_json(item) for item in json_array]
+
+
